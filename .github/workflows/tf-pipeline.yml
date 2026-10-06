@@ -290,13 +290,14 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
           docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
             aquasec/trivy:${{ env.TRIVY_VERSION }} image \
             --scanners vuln \
             --exit-code 0 \
             --format json \
-            --output trivy-image-report.json \
+            --output /work/trivy-image-report.json \
             ${{ env.IMAGE_NAME }}:latest
 
       - name: Quality Gate Imagen — Falla si hay CRITICAL
