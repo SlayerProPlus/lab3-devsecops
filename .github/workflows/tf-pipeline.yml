@@ -263,7 +263,8 @@ jobs:
   image-build-and-scan:
     name: "5. Image Build & Checker - Trivy"
     runs-on: ubuntu-latest
-    needs: [ build-and-test, sast-semgrep, sca-sbom ]
+    needs: [ build-and-test ]
+    if: always() && needs.build-and-test.result == 'success'
 
     steps:
       - name: Checkout del repositorio
