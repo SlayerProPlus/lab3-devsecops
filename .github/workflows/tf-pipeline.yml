@@ -135,7 +135,8 @@ jobs:
             -DincludeTestScope=false
 
       - name: Verificar que el SBOM fue generado
-        run: test -s target/bom.json && echo "SBOM generado correctamente" || (echo "ERROR: bom.json no existe o está vacío" && exit 1)
+        run: |
+          test -s target/bom.json && echo "SBOM generado correctamente" || (echo "ERROR: bom.json no existe o está vacío" && exit 1)
 
       - name: Escanear SBOM con Trivy (reporte completo JSON)
         # Este paso genera el reporte completo de vulnerabilidades en JSON para DefectDojo
