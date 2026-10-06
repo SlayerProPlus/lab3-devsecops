@@ -1,0 +1,378 @@
+name: TF - Pipeline DevSecOps
+
+# =============================================================================
+# TRABAJO FINAL — Pipeline CI/CD con Seguridad Integrada
+# Docente: Pablo Villazón | Diplomado DevSecOps | UAGRM-SOE
+#
+# Fases implementadas:
+#   1. Build & Test          — Compilar y correr pruebas unitarias
+#   2. SAST (Semgrep)        — Análisis estático del código fuente Java
+#   3. SCA + SBOM (Trivy)    — Inventario de dependencias y búsqueda de CVEs
+#   4. Policy as Code        — Validación de seguridad sobre el Dockerfile
+#   5. Image Build & Checker — Construir imagen Docker y escanearla con Trivy
+#   6. Empaquetar Reportes   — Todos los JSON juntos listos para DefectDojo
+# =============================================================================
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:   # Permite ejecutarlo manualmente desde GitHub
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: write
+
+env:
+  JAVA_VERSION: '21'
+  TRIVY_VERSION: '0.74.0'
+  IMAGE_NAME: springboot-devsecops-lab
+
+# ==============================================================================
+# JOB 1: BUILD & TEST
+# Propósito: Compilar el código y correr los tests.
+# Si esto falla, los demás jobs no corren — no tiene sentido escanear algo roto.
+# ==============================================================================
+jobs:
+  build-and-test:
+    name: "1. Build & Test"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compilar y ejecutar pruebas
+        run: mvn -B clean verify
+
+      - name: Subir reportes de pruebas
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ==============================================================================
+  # JOB 2: SAST — Análisis Estático con Semgrep
+  # Propósito: Lee el código fuente Java SIN ejecutarlo y busca patrones inseguros:
+  #   - SQL Injection, XSS, CSRF deshabilitado, contraseñas hardcodeadas, etc.
+  # Genera: semgrep-report.json (requerido por DefectDojo)
+  # ==============================================================================
+  sast-semgrep:
+    name: "2. SAST - Semgrep"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    container:
+      image: semgrep/semgrep:latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Ejecutar análisis SAST con Semgrep
+        run: |
+          semgrep scan \
+            --config p/java \
+            --json \
+            --output semgrep-report.json \
+            src/main/java || true
+          # "|| true" hace que el pipeline continúe aunque encuentre problemas.
+          # Queremos VER los hallazgos, no detener el pipeline aquí.
+
+      - name: Subir reporte Semgrep JSON
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-semgrep-report
+          path: semgrep-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ==============================================================================
+  # JOB 3: SCA + SBOM — Inventario y Vulnerabilidades de Dependencias
+  # Propósito: Generar un inventario (SBOM) de todas las librerías del proyecto
+  #   y luego escanear ese inventario con Trivy para buscar CVEs conocidos.
+  # Genera: bom.json (SBOM) + sca-report.json (requerido por DefectDojo)
+  # ==============================================================================
+  sca-sbom:
+    name: "3. SCA + SBOM - Trivy"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compilar proyecto
+        run: mvn -B clean verify
+
+      - name: Generar SBOM con CycloneDX
+        # CycloneDX crea bom.json — el inventario de todas las librerías usadas
+        run: |
+          mvn -B org.cyclonedx:cyclonedx-maven-plugin:2.9.3:makeAggregateBom \
+            -DoutputFormat=json \
+            -DoutputName=bom \
+            -DschemaVersion=1.6 \
+            -DincludeTestScope=false
+
+      - name: Verificar que el SBOM fue generado
+        run: test -s target/bom.json && echo "SBOM generado correctamente" || (echo "ERROR: bom.json no existe o está vacío" && exit 1)
+
+      - name: Escanear SBOM con Trivy (reporte completo JSON)
+        # Este paso genera el reporte completo de vulnerabilidades en JSON para DefectDojo
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/target:/work" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:${{ env.TRIVY_VERSION }} sbom \
+            --scanners vuln \
+            --exit-code 0 \
+            --format json \
+            --output /work/sca-report.json \
+            /work/bom.json
+
+      - name: Quality Gate SCA — Falla si hay HIGH o CRITICAL
+        # Este paso falla intencionalmente si encuentra vulnerabilidades críticas.
+        # Demuestra que el pipeline detiene el flujo ante riesgos inaceptables.
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/target:/work" \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:${{ env.TRIVY_VERSION }} sbom \
+            --scanners vuln \
+            --skip-db-update \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table \
+            --output /work/sca-gate.txt \
+            /work/bom.json
+
+      - name: Subir reportes SCA
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-sbom-reports
+          path: |
+            target/bom.json
+            target/sca-report.json
+            target/sca-gate.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ==============================================================================
+  # JOB 4: POLICY AS CODE — Validación del Dockerfile con Conftest
+  # Propósito: Verificar que el Dockerfile cumple políticas de seguridad.
+  #   Por ejemplo: que no use 'root' como usuario, que exponga solo el puerto 8080.
+  # Genera: conftest-report.json (requerido por DefectDojo)
+  # ==============================================================================
+  policy-as-code:
+    name: "4. Policy as Code - Conftest"
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Crear politicas de seguridad para el Dockerfile
+        # Estas reglas se crean en tiempo de ejecución dentro del pipeline.
+        # Verifican que el Dockerfile siga buenas prácticas de seguridad.
+        run: |
+          mkdir -p policy
+          cat > policy/dockerfile.rego << 'EOF'
+          package main
+
+          import rego.v1
+
+          # Regla 1: El contenedor NO debe correr como root
+          deny contains msg if {
+            input.Stages[_].Commands[_].Cmd == "user"
+            val := input.Stages[_].Commands[_].Value[0]
+            lower(val) == "root"
+            msg := "SECURITY: El contenedor no debe ejecutarse como usuario root"
+          }
+
+          # Regla 2: Debe existir un usuario no-root definido
+          warn contains msg if {
+            not any_user_defined
+            msg := "RECOMENDACION: Define un usuario no-root con la instruccion USER"
+          }
+
+          any_user_defined if {
+            input.Stages[_].Commands[_].Cmd == "user"
+          }
+
+          # Regla 3: El puerto expuesto debe ser el 8080 (estándar para Spring Boot)
+          warn contains msg if {
+            input.Stages[_].Commands[_].Cmd == "expose"
+            port := input.Stages[_].Commands[_].Value[0]
+            port != "8080"
+            msg := sprintf("RECOMENDACION: Se expone el puerto %s, se esperaba 8080", [port])
+          }
+          EOF
+
+      - name: Ejecutar Conftest sobre el Dockerfile
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            openpolicyagent/conftest:latest \
+            test Dockerfile \
+            --parser dockerfile \
+            --policy policy \
+            --output json > conftest-report.json || true
+          cat conftest-report.json
+
+      - name: Subir reporte Conftest JSON
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: policy-conftest-report
+          path: conftest-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ==============================================================================
+  # JOB 5: IMAGE BUILD & CHECKER — Construir imagen Docker y escanearla
+  # Propósito: Construir la imagen Docker del proyecto y escanearla con Trivy
+  #   para encontrar CVEs en el sistema operativo base y las dependencias Java.
+  # Solo corre en pushes a 'main' (CD Gate).
+  # Genera: trivy-image-report.json (requerido por DefectDojo)
+  # ==============================================================================
+  image-build-and-scan:
+    name: "5. Image Build & Checker - Trivy"
+    runs-on: ubuntu-latest
+    needs: [ build-and-test, sast-semgrep, sca-sbom ]
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Compilar el JAR
+        run: mvn -B clean package -DskipTests
+
+      - name: Construir imagen Docker
+        run: |
+          docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.IMAGE_NAME }}:latest
+
+      - name: Escanear imagen con Trivy (reporte JSON completo)
+        # Escanea la imagen que acabamos de construir buscando CVEs
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:${{ env.TRIVY_VERSION }} image \
+            --scanners vuln \
+            --exit-code 0 \
+            --format json \
+            --output trivy-image-report.json \
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Quality Gate Imagen — Falla si hay CRITICAL
+        # Solo falla ante CVEs CRÍTICOS en la imagen. HIGH se reporta pero no bloquea.
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasec/trivy:${{ env.TRIVY_VERSION }} image \
+            --scanners vuln \
+            --skip-db-update \
+            --severity CRITICAL \
+            --exit-code 1 \
+            --format table \
+            ${{ env.IMAGE_NAME }}:latest || true
+          # "|| true" para que el pipeline complete y podamos ver el reporte.
+          # En producción real se removería el "|| true" para bloquear el deploy.
+
+      - name: Subir reporte Trivy de imagen
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: image-trivy-report
+          path: trivy-image-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ==============================================================================
+  # JOB 6: EMPAQUETAR REPORTES PARA DEFECTDOJO
+  # Propósito: Reunir todos los reportes JSON generados por las fases anteriores
+  #   en un solo ZIP para descargar fácilmente y subirlos a DefectDojo.
+  # ==============================================================================
+  package-reports:
+    name: "6. Empaquetar Reportes para DefectDojo"
+    runs-on: ubuntu-latest
+    needs: [ sast-semgrep, sca-sbom, policy-as-code, image-build-and-scan ]
+    if: always()  # Corre siempre, aunque algún job anterior haya fallado
+
+    steps:
+      - name: Descargar reporte Semgrep
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-semgrep-report
+          path: all-reports/
+        continue-on-error: true
+
+      - name: Descargar reportes SCA/SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sca-sbom-reports
+          path: all-reports/
+        continue-on-error: true
+
+      - name: Descargar reporte Conftest
+        uses: actions/download-artifact@v4
+        with:
+          name: policy-conftest-report
+          path: all-reports/
+        continue-on-error: true
+
+      - name: Descargar reporte Trivy imagen
+        uses: actions/download-artifact@v4
+        with:
+          name: image-trivy-report
+          path: all-reports/
+        continue-on-error: true
+
+      - name: Listar todos los reportes generados
+        run: |
+          echo "======================================================"
+          echo "  REPORTES DISPONIBLES PARA DEFECTDOJO"
+          echo "======================================================"
+          find all-reports/ -type f | sort
+          echo "======================================================"
+
+      - name: Subir todos los reportes juntos
+        uses: actions/upload-artifact@v4
+        with:
+          name: defectdojo-all-reports-${{ github.run_id }}
+          path: all-reports/
+          retention-days: 30

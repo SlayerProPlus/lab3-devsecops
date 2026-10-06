@@ -1,9 +1,12 @@
-name: SCA y SBOM
+name: SCA y SBOM [DESHABILITADO]
 
+# DESHABILITADO — SCA ahora forma parte de tf-pipeline.yml
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      dummy:
+        description: 'Este workflow está deshabilitado'
+        required: false
 
 permissions:
   contents: read
