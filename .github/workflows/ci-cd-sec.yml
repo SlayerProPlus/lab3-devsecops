@@ -1,12 +1,12 @@
-name: CI/CD - Spring Boot DevSecOps
+name: CI/CD - Spring Boot DevSecOps [DESHABILITADO]
 
+# DESHABILITADO — Reemplazado por tf-pipeline.yml para el Trabajo Final
 on:
-  push:
-    branches: [ main, develop, feature/**, bugfix/**, hotfix/** ]
-  pull_request:
-    branches: [ main, develop ]
-  # Optional: also trigger on version tags
-  # tags: [ 'v*.*.*' ]
+  workflow_dispatch:
+    inputs:
+      dummy:
+        description: 'Este workflow está deshabilitado'
+        required: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

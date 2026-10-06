@@ -1,10 +1,12 @@
-name: CI - Spring Boot DevSecOps
+name: CI - Spring Boot DevSecOps [DESHABILITADO]
 
+# DESHABILITADO — Reemplazado por tf-pipeline.yml para el Trabajo Final
 on:
-  push:
-    branches: [ 'feature/**', 'bugfix/**', 'hotfix/**' ]
-  pull_request:
-    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      dummy:
+        description: 'Este workflow está deshabilitado'
+        required: false
 
 # Cancel in-progress runs for the same branch/PR
 concurrency:
